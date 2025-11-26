@@ -88,4 +88,10 @@ dependencies {
     // --- DEBUGGING ---
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
+
+    // TAMBAHKAN INI UNTUK GPS / LOKASI
+    implementation("com.google.android.gms:play-services-location:21.0.1")
+
+    // Pastikan icons extended tetap ada
+    implementation("androidx.compose.material:material-icons-extended")
 }
