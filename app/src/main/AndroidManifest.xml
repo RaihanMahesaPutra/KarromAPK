@@ -21,7 +21,7 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:label="Karrom2"
+            android:label="AlQuran Karrom"
             android:theme="@style/Theme.Karrom2">
 
             <intent-filter>
