@@ -10,6 +10,8 @@ import android.content.res.Configuration
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
+import android.view.Surface // <-- PENTING UNTUK DETEKSI ROTASI
+import android.view.WindowManager // <-- PENTING
 import android.hardware.SensorManager
 import android.location.Geocoder
 import android.location.Location
@@ -32,6 +34,7 @@ import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -47,9 +50,11 @@ import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -65,8 +70,9 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.google.android.gms.location.*
-import com.google.gson.annotations.SerializedName // PENTING: Import ini wajib ada
+import com.google.gson.annotations.SerializedName
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -76,26 +82,35 @@ import retrofit2.http.GET
 import retrofit2.http.Path
 import retrofit2.http.Query
 import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 import kotlin.math.PI
 
 // ==============================
-// 1. DATA LAYER (API MODELS)
+// 1. DATA LAYER (MODELS)
 // ==============================
 
 const val BASE_URL_QURAN = "https://api.quran.gading.dev/"
 const val BASE_URL_PRAYER = "https://api.aladhan.com/v1/"
-const val BASE_URL_ASMAUL = "https://api.myquran.com/v2/"
 
-// --- QURAN ---
+// --- QURAN (FIXED META JUZ) ---
 data class SurahResponse(val code: Int, val data: List<SurahSummary>)
 data class SurahDetailResponse(val code: Int, val data: SurahDetailData)
 data class SurahSummary(val number: Int, val name: SurahName, val revelation: Revelation)
 data class SurahDetailData(val number: Int, val name: SurahName, val revelation: Revelation, val verses: List<Verse>)
 data class SurahName(val short: String, val transliteration: TranslationBlock, val translation: TranslationBlock)
 data class Revelation(val id: String)
-data class Verse(val number: VerseNumber, val text: VerseText, val translation: TranslationBlock)
+
+// Update Verse: Menambahkan Meta (Juz)
+data class Verse(
+    val number: VerseNumber,
+    val text: VerseText,
+    val translation: TranslationBlock,
+    val meta: VerseMeta?
+)
+data class VerseMeta(val juz: Int) // Model untuk Juz
+
 data class VerseNumber(val inSurah: Int)
 data class VerseText(val arab: String, val transliteration: TransliterationDetail)
 data class TransliterationDetail(val en: String)
@@ -106,25 +121,9 @@ data class PrayerResponse(val code: Int, val data: PrayerData)
 data class PrayerData(val timings: Timings)
 data class Timings(val Fajr: String, val Sunrise: String, val Dhuhr: String, val Asr: String, val Maghrib: String, val Isha: String, val Imsak: String)
 
-// --- ASMAUL HUSNA (FIXED ARTINYA) ---
-data class AsmaulHusnaResponse(val data: List<AsmaulHusnaData>)
-data class AsmaulHusnaData(
-    @SerializedName("urutan") val index: String?, // Mapping dari "urutan" ke "index"
-    @SerializedName("latin") val latin: String?,
-    @SerializedName("arab") val arab: String?,
-    @SerializedName("indo") val artinya: String? // Mapping dari "indo" ke "artinya" (SOLUSI MASALAH)
-)
-
-// --- DOA HARIAN (DATA LOKAL) ---
-data class DoaItem(
-    val id: Int,
-    val judul: String,
-    val judulEn: String,
-    val arab: String,
-    val latin: String,
-    val terjemahan: String,
-    val terjemahanEn: String
-)
+// --- DATA LOKAL MODELS ---
+data class DoaItem(val id: Int, val judul: String, val judulEn: String, val arab: String, val latin: String, val terjemahan: String, val terjemahanEn: String)
+data class AsmaulHusnaItem(val id: Int, val arab: String, val latin: String, val indo: String, val en: String)
 
 // ==============================
 // 2. API CLIENTS
@@ -137,18 +136,14 @@ interface QuranApi {
 interface PrayerApi {
     @GET("timings/{date}") suspend fun getTimings(@Path("date") date: String, @Query("latitude") lat: Double, @Query("longitude") long: Double, @Query("method") method: Int = 20): PrayerResponse
 }
-interface AsmaulApi {
-    @GET("husna/semua") suspend fun getAsmaulHusna(): AsmaulHusnaResponse
-}
 
 object ApiClient {
     val quranApi: QuranApi by lazy { Retrofit.Builder().baseUrl(BASE_URL_QURAN).addConverterFactory(GsonConverterFactory.create()).build().create(QuranApi::class.java) }
     val prayerApi: PrayerApi by lazy { Retrofit.Builder().baseUrl(BASE_URL_PRAYER).addConverterFactory(GsonConverterFactory.create()).build().create(PrayerApi::class.java) }
-    val asmaulApi: AsmaulApi by lazy { Retrofit.Builder().baseUrl(BASE_URL_ASMAUL).addConverterFactory(GsonConverterFactory.create()).build().create(AsmaulApi::class.java) }
 }
 
 // ==============================
-// 3. STATIC DATA (DOA)
+// 3. STATIC DATA (UPDATED: 20 DOA)
 // ==============================
 object LocalData {
     val listDoa = listOf(
@@ -172,6 +167,108 @@ object LocalData {
         DoaItem(18, "Doa Ketika Mendengar Petir", "Prayer Hearing Thunder", "سُبْحَانَ الَّذِي يُسَبِّحُ الرَّعْدُ بِحَمْدِهِ وَالْمَلَائِكَةُ مِنْ خِيفَتِهِ", "Subhaanalladzi yusabbihur ro’du bihamdihi wal malaaikatu min khiifatihi", "Maha Suci Allah yang petir bertasbih dengan memuji-Nya dan para malaikat takut kepada-Nya", "Glory be to Him whom thunder praises with His praise, and the angels from the fear of Him"),
         DoaItem(19, "Doa Kebaikan Dunia Akhirat", "Prayer for Goodness", "رَبَّنَا آتِنَا فِي الدُّنْيَا حَسَنَةً وَفِي الْآخِرَةِ حَسَنَةً وَقِنَا عَذَابَ النَّارِ", "Rabbanaa aatinaa fid dunyaa hasanah wa fil aakhirati hasanah wa qinaa 'adzaaban naar", "Ya Tuhan kami, berilah kami kebaikan di dunia dan kebaikan di akhirat dan peliharalah kami dari siksa neraka", "Our Lord, give us in this world [that which is] good and in the Hereafter [that which is] good and protect us from the punishment of the Fire"),
         DoaItem(20, "Doa Untuk Kedua Orang Tua", "Prayer for Parents", "رَبِّ اغْفِرْ لِيْ وَلِوَالِدَيَّ وَارْحَمْهُمَا كَمَا رَبَّيَانِيْ صَغِيْرًا", "Robbighfir lii wa li waalidayya warhamhumaa kamaa robbayaanii shoghiiroo", "Ya Tuhanku, ampunilah dosaku dan dosa kedua orang tuaku, dan sayangilah keduanya sebagaimana mereka menyayangi aku di waktu kecil", "My Lord, forgive me and my parents and have mercy upon them as they brought me up [when I was] small")
+    )
+
+    val listAsmaulHusna = listOf(
+        AsmaulHusnaItem(1, "الرَّحْمَنُ", "Ar Rahman", "Maha Pengasih", "The Beneficent"),
+        AsmaulHusnaItem(2, "الرَّحِيمُ", "Ar Rahiim", "Maha Penyayang", "The Merciful"),
+        AsmaulHusnaItem(3, "الْمَلِكُ", "Al Malik", "Maha Merajai", "The King"),
+        AsmaulHusnaItem(4, "الْقُدُّوسُ", "Al Quddus", "Maha Suci", "The Most Holy"),
+        AsmaulHusnaItem(5, "السَّلاَمُ", "As Salaam", "Maha Memberi Kesejahteraan", "The Source of Peace"),
+        AsmaulHusnaItem(6, "الْمُؤْمِنُ", "Al Mu`min", "Maha Memberi Keamanan", "The Guardian of Faith"),
+        AsmaulHusnaItem(7, "الْمُهَيْمِنُ", "Al Muhaimin", "Maha Pemelihara", "The Protector"),
+        AsmaulHusnaItem(8, "الْعَزِيزُ", "Al `Aziiz", "Maha Perkasa", "The Mighty"),
+        AsmaulHusnaItem(9, "الْجَبَّارُ", "Al Jabbar", "Maha Memiliki Mutlak Kegagahan", "The Compeller"),
+        AsmaulHusnaItem(10, "الْمُتَكَبِّرُ", "Al Mutakabbir", "Maha Megah", "The Majestic"),
+        AsmaulHusnaItem(11, "الْخَالِقُ", "Al Khaliq", "Maha Pencipta", "The Creator"),
+        AsmaulHusnaItem(12, "الْبَارِئُ", "Al Baari`", "Maha Melepaskan", "The Evolver"),
+        AsmaulHusnaItem(13, "الْمُصَوِّرُ", "Al Mushawwir", "Maha Membentuk Rupa", "The Fashioner"),
+        AsmaulHusnaItem(14, "الْغَفَّارُ", "Al Ghaffaar", "Maha Pengampun", "The Forgiver"),
+        AsmaulHusnaItem(15, "الْقَهَّارُ", "Al Qahhaar", "Maha Memaksa", "The Subduer"),
+        AsmaulHusnaItem(16, "الْوَهَّابُ", "Al Wahhaab", "Maha Pemberi Karunia", "The Bestower"),
+        AsmaulHusnaItem(17, "الرَّزَّاقُ", "Ar Razzaaq", "Maha Pemberi Rezeki", "The Provider"),
+        AsmaulHusnaItem(18, "الْفَتَّاحُ", "Al Fattaah", "Maha Pembuka Rahmat", "The Opener"),
+        AsmaulHusnaItem(19, "الْعَلِيمُ", "Al `Aliim", "Maha Mengetahui", "The All-Knowing"),
+        AsmaulHusnaItem(20, "الْقَابِضُ", "Al Qaabidh", "Maha Menyempitkan", "The Constrictor"),
+        AsmaulHusnaItem(21, "الْبَاسِطُ", "Al Baasith", "Maha Melapangkan", "The Expander"),
+        AsmaulHusnaItem(22, "الْخَافِضُ", "Al Khaafidh", "Maha Merendahkan", "The Abaser"),
+        AsmaulHusnaItem(23, "الرَّافِعُ", "Ar Raafi`", "Maha Meninggikan", "The Exalter"),
+        AsmaulHusnaItem(24, "الْمُعِزُّ", "Al Mu`izz", "Maha Memuliakan", "The Honorer"),
+        AsmaulHusnaItem(25, "الْمُذِلُّ", "Al Mudzil", "Maha Menghinakan", "The Dishonorer"),
+        AsmaulHusnaItem(26, "السَّمِيعُ", "As Samii`", "Maha Mendengar", "The All-Hearing"),
+        AsmaulHusnaItem(27, "الْبَصِيرُ", "Al Bashiir", "Maha Melihat", "The All-Seeing"),
+        AsmaulHusnaItem(28, "الْحَكَمُ", "Al Hakam", "Maha Menetapkan", "The Judge"),
+        AsmaulHusnaItem(29, "الْعَدْلُ", "Al `Adl", "Maha Adil", "The Just"),
+        AsmaulHusnaItem(30, "اللَّطِيفُ", "Al Lathiif", "Maha Lembut", "The Latif"),
+        AsmaulHusnaItem(31, "الْخَبِيرُ", "Al Khabiiir", "Maha Mengenal", "The All-Aware"),
+        AsmaulHusnaItem(32, "الْحَلِيمُ", "Al Haliim", "Maha Penyantun", "The Forbearing"),
+        AsmaulHusnaItem(33, "الْعَظِيمُ", "Al `Azhiim", "Maha Agung", "The Magnificent"),
+        AsmaulHusnaItem(34, "الْغَفُورُ", "Al Ghafuur", "Maha Memberi Pengampunan", "The Forgiver"),
+        AsmaulHusnaItem(35, "الشَّكُورُ", "As Syakuur", "Maha Pembalas Budi", "The Grateful"),
+        AsmaulHusnaItem(36, "الْعَلِيُّ", "Al `Aliy", "Maha Tinggi", "The High"),
+        AsmaulHusnaItem(37, "الْكَبِيرُ", "Al Kabiir", "Maha Besar", "The Great"),
+        AsmaulHusnaItem(38, "الْحَفِيظُ", "Al Hafizh", "Maha Memelihara", "The Preserver"),
+        AsmaulHusnaItem(39, "الْمُقِيتُ", "Al Muqiit", "Maha Pemberi Kecukupan", "The Nourisher"),
+        AsmaulHusnaItem(40, "الْحَسِيبُ", "Al Hasiib", "Maha Membuat Perhitungan", "The Reckoner"),
+        AsmaulHusnaItem(41, "الْجَلِيلُ", "Al Jaliil", "Maha Luhur", "The Majestic"),
+        AsmaulHusnaItem(42, "الْكَرِيمُ", "Al Kariim", "Maha Pemurah", "The Generous"),
+        AsmaulHusnaItem(43, "الرَّقِيبُ", "Ar Raqiib", "Maha Mengawasi", "The Watchful"),
+        AsmaulHusnaItem(44, "الْمُجِيبُ", "Al Mujiib", "Maha Mengabulkan", "The Responder"),
+        AsmaulHusnaItem(45, "الْوَاسِعُ", "Al Waasi`", "Maha Luas", "The All-Encompassing"),
+        AsmaulHusnaItem(46, "الْحَكِيمُ", "Al Hakiim", "Maha Bijaksana", "The Wise"),
+        AsmaulHusnaItem(47, "الْوَدُودُ", "Al Waduud", "Maha Mengasihi", "The Loving"),
+        AsmaulHusnaItem(48, "الْمَجِيدُ", "Al Majiid", "Maha Mulia", "The Glorious"),
+        AsmaulHusnaItem(49, "الْبَاعِثُ", "Al Baa`its", "Maha Membangkitkan", "The Resurrector"),
+        AsmaulHusnaItem(50, "الشَّهِيدُ", "As Syahiid", "Maha Menyaksikan", "The Witness"),
+        AsmaulHusnaItem(51, "الْحَقُّ", "Al Haqq", "Maha Benar", "The Truth"),
+        AsmaulHusnaItem(52, "الْوَكِيلُ", "Al Wakiil", "Maha Memelihara", "The Trustee"),
+        AsmaulHusnaItem(53, "الْقَوِيُّ", "Al Qawiyyu", "Maha Kuat", "The Strong"),
+        AsmaulHusnaItem(54, "الْمَتِينُ", "Al Matiin", "Maha Kokoh", "The Firm"),
+        AsmaulHusnaItem(55, "الْوَلِيُّ", "Al Waliyy", "Maha Melindungi", "The Protecting Friend"),
+        AsmaulHusnaItem(56, "الْحَمِيدُ", "Al Hamiid", "Maha Terpuji", "The Praiseworthy"),
+        AsmaulHusnaItem(57, "الْمُحْصِي", "Al Muhshii", "Maha Mengalkulasi", "The Counter"),
+        AsmaulHusnaItem(58, "الْمُبْدِئُ", "Al Mubdi`", "Maha Memulai", "The Originator"),
+        AsmaulHusnaItem(59, "الْمُعِيدُ", "Al Mu`iid", "Maha Mengembalikan Kehidupan", "The Restorer"),
+        AsmaulHusnaItem(60, "الْمُحْيِي", "Al Muhyii", "Maha Menghidupkan", "The Giver of Life"),
+        AsmaulHusnaItem(61, "الْمُمِيتُ", "Al Mumiit", "Maha Mematikan", "The Taker of Life"),
+        AsmaulHusnaItem(62, "الْحَيُّ", "Al Hayyu", "Maha Hidup", "The Living"),
+        AsmaulHusnaItem(63, "الْقَيُّومُ", "Al Qayyum", "Maha Mandiri", "The Self-Subsisting"),
+        AsmaulHusnaItem(64, "الْوَاجِدُ", "Al Waajid", "Maha Penemu", "The Finder"),
+        AsmaulHusnaItem(65, "الْمَاجِدُ", "Al Maajid", "Maha Mulia", "The Noble"),
+        AsmaulHusnaItem(66, "الْوَاحِدُ", "Al Wahid", "Maha Tunggal", "The One"),
+        AsmaulHusnaItem(67, "الْاَحَدُ", "Al Ahad", "Maha Esa", "The Unique"),
+        AsmaulHusnaItem(68, "الصَّمَدُ", "As Shamad", "Maha Dibutuhkan", "The Eternal"),
+        AsmaulHusnaItem(69, "الْقَادِرُ", "Al Qaadir", "Maha Menentukan", "The Able"),
+        AsmaulHusnaItem(70, "الْمُقْتَدِرُ", "Al Muqtadir", "Maha Berkuasa", "The Powerful"),
+        AsmaulHusnaItem(71, "الْمُقَدِّمُ", "Al Muqaddim", "Maha Mendahulukan", "The Expediter"),
+        AsmaulHusnaItem(72, "الْمُؤَخِّرُ", "Al Mu`akkhir", "Maha Mengakhirkan", "The Delayer"),
+        AsmaulHusnaItem(73, "الْاَوَّلُ", "Al Awwal", "Maha Awal", "The First"),
+        AsmaulHusnaItem(74, "الْاٰخِرُ", "Al Aakhir", "Maha Akhir", "The Last"),
+        AsmaulHusnaItem(75, "الظَّاهِرُ", "Az Zhaahir", "Maha Nyata", "The Manifest"),
+        AsmaulHusnaItem(76, "الْبَاطِنُ", "Al Baathin", "Maha Ghaib", "The Hidden"),
+        AsmaulHusnaItem(77, "الْوَالِي", "Al Waali", "Maha Memerintah", "The Governor"),
+        AsmaulHusnaItem(78, "الْمُتَعَالِي", "Al Muta`aalii", "Maha Tinggi", "The Most Exalted"),
+        AsmaulHusnaItem(79, "الْبَرُّ", "Al Barr", "Maha Penderma", "The Source of Goodness"),
+        AsmaulHusnaItem(80, "التَّوَّابُ", "At Tawwaab", "Maha Penerima Taubat", "The Acceptor of Repentance"),
+        AsmaulHusnaItem(81, "الْمُنْتَقِمُ", "Al Muntaqim", "Maha Pemberi Balasan", "The Avenger"),
+        AsmaulHusnaItem(82, "العَفُوُّ", "Al Afuww", "Maha Pemaaf", "The Pardoner"),
+        AsmaulHusnaItem(83, "الرَّؤُوفُ", "Ar Ra`uuf", "Maha Pengasuh", "The Compassionate"),
+        AsmaulHusnaItem(84, "مَالِكُ الْمُلْكِ", "Malikul Mulk", "Maha Penguasa Kerajaan", "The Eternal Owner of Sovereignty"),
+        AsmaulHusnaItem(85, "ذُو الْجَلاَلِ وَالْاِكْرَامِ", "Dzul Jalaali Wal Ikraam", "Maha Pemilik Kebesaran dan Kemuliaan", "The Lord of Majesty and Bounty"),
+        AsmaulHusnaItem(86, "الْمُقْسِطُ", "Al Muqsith", "Maha Pemberi Keadilan", "The Equitable"),
+        AsmaulHusnaItem(87, "الْجَامِعُ", "Al Jaami`", "Maha Mengumpulkan", "The Gatherer"),
+        AsmaulHusnaItem(88, "الْغَنِيُّ", "Al Ghaniyy", "Maha Kaya", "The Self-Subsisting"),
+        AsmaulHusnaItem(89, "الْمُغْنِي", "Al Mughni", "Maha Pemberi Kekayaan", "The Enricher"),
+        AsmaulHusnaItem(90, "الْمَانِعُ", "Al Maani", "Maha Mencegah", "The Preventer"),
+        AsmaulHusnaItem(91, "الضَّارُّ", "Ad Dhaar", "Maha Penimpa Kemudharatan", "The Distresser"),
+        AsmaulHusnaItem(92, "النَّافِعُ", "An Naafi`", "Maha Memberi Manfaat", "The Propitious"),
+        AsmaulHusnaItem(93, "النُّورُ", "An Nuur", "Maha Bercahaya", "The Light"),
+        AsmaulHusnaItem(94, "الْهَادِي", "Al Haadi", "Maha Pemberi Petunjuk", "The Guide"),
+        AsmaulHusnaItem(95, "الْبَدِيعُ", "Al Badii`", "Maha Pencipta", "The Incomparable"),
+        AsmaulHusnaItem(96, "الْبَاقِي", "Al Baaqii", "Maha Kekal", "The Everlasting"),
+        AsmaulHusnaItem(97, "الْوَارِثُ", "Al Waarits", "Maha Pewaris", "The Supreme Inheritor"),
+        AsmaulHusnaItem(98, "الرَّشِيدُ", "Ar Rasyiid", "Maha Pandai", "The Guide to the Right Path"),
+        AsmaulHusnaItem(99, "الصَّبُورُ", "As Shabuur", "Maha Sabar", "The Patient")
     )
 }
 
@@ -223,15 +320,18 @@ class MainViewModel : ViewModel() {
 
     // Data
     private val _surahList = MutableStateFlow<List<SurahSummary>>(emptyList())
-    private val _detailSurah = MutableStateFlow<SurahDetailData?>(null)
-    val detailSurah = _detailSurah.asStateFlow()
+    private val _loadedSurahs = MutableStateFlow<List<SurahDetailData>>(emptyList())
+    val loadedSurahs = _loadedSurahs.asStateFlow()
+
     private val _prayerTimes = MutableStateFlow<Timings?>(null)
     val prayerTimes = _prayerTimes.asStateFlow()
     private val _locationName = MutableStateFlow("")
     val locationName = _locationName.asStateFlow()
     private val _userCoordinates = MutableStateFlow<Pair<Double, Double>?>(null)
     val userCoordinates = _userCoordinates.asStateFlow()
-    private val _asmaulHusnaList = MutableStateFlow<List<AsmaulHusnaData>>(emptyList())
+
+    // Local Data States
+    private val _asmaulHusnaList = MutableStateFlow<List<AsmaulHusnaItem>>(emptyList())
     private val _doaList = MutableStateFlow<List<DoaItem>>(emptyList())
     private val _isLoading = MutableStateFlow(false)
     val isLoading = _isLoading.asStateFlow()
@@ -242,7 +342,7 @@ class MainViewModel : ViewModel() {
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val filteredAsmaulHusna = combine(_asmaulHusnaList, _asmaulQuery) { list, query ->
-        if (query.isBlank()) list else list.filter { (it.latin ?: "").contains(query, true) || (it.artinya ?: "").contains(query, true) }
+        if (query.isBlank()) list else list.filter { it.latin.contains(query, true) || it.indo.contains(query, true) || it.en.contains(query, true) }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val filteredDoaList = combine(_doaList, _doaQuery) { list, query ->
@@ -256,21 +356,20 @@ class MainViewModel : ViewModel() {
     fun onSearchDoa(q: String) { _doaQuery.value = q }
 
     private fun fetchSurahList() { viewModelScope.launch { _isLoading.value = true; try { _surahList.value = ApiClient.quranApi.getSurahList().data } catch (e: Exception) { e.printStackTrace() } finally { _isLoading.value = false } } }
+    private fun fetchAsmaulHusna() { _asmaulHusnaList.value = LocalData.listAsmaulHusna }
+    private fun fetchDoaList() { _doaList.value = LocalData.listDoa }
 
-    private fun fetchAsmaulHusna() {
-        viewModelScope.launch {
-            try {
-                // Menggunakan API MyQuran untuk Data Indonesia
-                _asmaulHusnaList.value = ApiClient.asmaulApi.getAsmaulHusna().data
-            } catch (e: Exception) { e.printStackTrace() }
+    // FIX BUG NAVIGATION: Hanya load jika list kosong ATAU surat yang diminta beda
+    fun openSurah(number: Int) {
+        val current = _loadedSurahs.value.firstOrNull()
+        if (_loadedSurahs.value.isEmpty() || current?.number != number) {
+            _loadedSurahs.value = emptyList()
+            fetchAndAppendSurah(number)
         }
     }
 
-    private fun fetchDoaList() {
-        _doaList.value = LocalData.listDoa
-    }
-
-    fun fetchSurahDetail(n: Int) { viewModelScope.launch { _isLoading.value = true; _detailSurah.value = null; try { _detailSurah.value = ApiClient.quranApi.getSurahDetail(n).data } catch (e: Exception) { e.printStackTrace() } finally { _isLoading.value = false } } }
+    fun loadNextSurah() { val last = _loadedSurahs.value.lastOrNull(); if (last != null && last.number < 114 && !_isLoading.value) fetchAndAppendSurah(last.number + 1) }
+    private fun fetchAndAppendSurah(n: Int) { viewModelScope.launch { _isLoading.value = true; try { val new = ApiClient.quranApi.getSurahDetail(n).data; _loadedSurahs.value += new } catch (e: Exception) { e.printStackTrace() } finally { _isLoading.value = false } } }
     fun fetchPrayerAndCity(ctx: Context, lat: Double, long: Double) { viewModelScope.launch { _isLoading.value = true; _userCoordinates.value = Pair(lat, long); try { val city = withContext(Dispatchers.IO) { try { val g = Geocoder(ctx, Locale.getDefault()); val a = g.getFromLocation(lat, long, 1); if (!a.isNullOrEmpty()) a[0].subAdminArea ?: a[0].locality else "Lat: ${String.format("%.2f", lat)}" } catch (e: Exception) { "Lat: ${String.format("%.2f", lat)}" } }; _locationName.value = city ?: "Lokasi Tidak Dikenal"; val d = SimpleDateFormat("dd-MM-yyyy", Locale.getDefault()).format(Date()); _prayerTimes.value = ApiClient.prayerApi.getTimings(d, lat, long).data.timings } catch (e: Exception) { e.printStackTrace() } finally { _isLoading.value = false } } }
 }
 
@@ -290,7 +389,7 @@ fun Karrom2Theme(content: @Composable () -> Unit) {
     val dark = isSystemInDarkTheme()
     val colors = if (dark) darkColorScheme(primary = Color(0xFF5EEAD4), onPrimary = Color(0xFF0F3935), secondary = Color(0xFFFDE68A), onSecondary = Color(0xFF451B00), background = Color(0xFF111827), surface = Color(0xFF1F2937), onSurface = Color(0xFFF9FAFB), primaryContainer = Color(0xFF134E4A), onPrimaryContainer = Color(0xFFCCFBF1), secondaryContainer = Color(0xFF4B3C2A), onSecondaryContainer = Color(0xFFFDE68A))
     else lightColorScheme(primary = Color(0xFF0F766E), onPrimary = Color.White, secondary = Color(0xFFD97706), onSecondary = Color.White, background = Color(0xFFF0FDFA), surface = Color.White, onSurface = Color(0xFF111827), primaryContainer = Color(0xFFCCFBF1), onPrimaryContainer = Color(0xFF0F514D), secondaryContainer = Color(0xFFFEF3C7), onSecondaryContainer = Color(0xFF78350F))
-    MaterialTheme(colorScheme = colors, content = content)
+    val view = androidx.compose.ui.platform.LocalView.current; if (!view.isInEditMode) SideEffect { val w = (view.context as android.app.Activity).window; w.statusBarColor = android.graphics.Color.BLACK; androidx.core.view.WindowCompat.getInsetsController(w, view).isAppearanceLightStatusBars = false }; MaterialTheme(colorScheme = colors, content = content)
 }
 
 sealed class Screen(val route: String, val title: String, val icon: ImageVector) {
@@ -316,7 +415,22 @@ fun MainApp() {
             }
         }
     }) {
-        Scaffold(topBar = { TopAppBar(title = { Text(when (currentRoute) { Screen.Prayer.route -> uiStrings.tabPrayer; Screen.Asmaul.route -> uiStrings.tabAsmaul; Screen.Doa.route -> uiStrings.tabDoa; else -> uiStrings.appTitle }, fontWeight = FontWeight.Bold) }, navigationIcon = { IconButton({ scope.launch { drawerState.open() } }) { Icon(Icons.Default.Menu, "Menu") } }, actions = { IconButton({ vm.toggleLanguage() }) { Icon(Icons.Default.Language, "Lang") } }, colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.primary, titleContentColor = MaterialTheme.colorScheme.onPrimary, navigationIconContentColor = MaterialTheme.colorScheme.onPrimary, actionIconContentColor = MaterialTheme.colorScheme.onPrimary)) }) { padding ->
+        Scaffold(topBar = {
+            Column {
+                TopAppBar(
+                    title = { Text(when (currentRoute) { Screen.Prayer.route -> uiStrings.tabPrayer; Screen.Asmaul.route -> uiStrings.tabAsmaul; Screen.Doa.route -> uiStrings.tabDoa; else -> uiStrings.appTitle }, fontWeight = FontWeight.Bold) },
+                    navigationIcon = { IconButton({ scope.launch { drawerState.open() } }) { Icon(Icons.Default.Menu, "Menu") } },
+                    actions = { IconButton({ vm.toggleLanguage() }) { Icon(Icons.Default.Language, "Lang") } },
+                    colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.primary, titleContentColor = MaterialTheme.colorScheme.onPrimary, navigationIconContentColor = MaterialTheme.colorScheme.onPrimary, actionIconContentColor = MaterialTheme.colorScheme.onPrimary)
+                )
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(2.dp)
+                        .background(Color.White.copy(alpha = 0.3f))
+                )
+            }
+        }) { padding ->
             NavHost(navController, startDestination = Screen.Quran.route, modifier = Modifier.padding(padding)) {
                 composable(Screen.Quran.route) { QuranScreen(navController, vm) }
                 composable(Screen.Prayer.route) { PrayerScreen(vm) }
@@ -364,6 +478,11 @@ fun PrayerScreen(vm: MainViewModel) {
     LaunchedEffect(Unit) { if (ActivityCompat.checkSelfPermission(ctx, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED && pt == null) getCurrentLocation(ctx, client, vm) }
     if (showComp && coords != null) QiblaCompassDialog({ showComp = false }, coords!!.first, coords!!.second)
 
+    var currentTimeMinutes by remember { mutableStateOf(0) }
+    LaunchedEffect(Unit) { while(true) { val c = Calendar.getInstance(); currentTimeMinutes = c.get(Calendar.HOUR_OF_DAY) * 60 + c.get(Calendar.MINUTE); delay(60000) } }
+    val nextPrayerName = remember(pt, currentTimeMinutes) { pt?.let { timings -> fun parse(t: String) = try { val p = t.split(":"); p[0].toInt()*60 + p[1].toInt() } catch(e: Exception) { 0 };
+        val times = listOf("Imsak" to timings.Imsak, "Subuh" to timings.Fajr, "Terbit" to timings.Sunrise, "Dzuhur" to timings.Dhuhr, "Ashar" to timings.Asr, "Maghrib" to timings.Maghrib, "Isya" to timings.Isha); val next = times.firstOrNull { parse(it.second.take(5)) > currentTimeMinutes }; next?.first ?: "Subuh" } ?: "" }
+
     val locContent = @Composable {
         Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer), shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth()) {
             Column(Modifier.padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -379,33 +498,29 @@ fun PrayerScreen(vm: MainViewModel) {
     val items = listOfNotNull(pt?.let{"Imsak" to it.Imsak}, pt?.let{"Subuh" to it.Fajr}, pt?.let{"Terbit" to it.Sunrise}, pt?.let{"Dzuhur" to it.Dhuhr}, pt?.let{"Ashar" to it.Asr}, pt?.let{"Maghrib" to it.Maghrib}, pt?.let{"Isya" to it.Isha})
     Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).padding(16.dp)) {
         if (load) CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
-        else if (isLand) Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(16.dp)) { Column(Modifier.weight(0.4f), verticalArrangement = Arrangement.Center) { locContent() }; LazyVerticalGrid(GridCells.Fixed(2), Modifier.weight(0.6f), horizontalArrangement = Arrangement.spacedBy(8.dp)) { items(items) { (n, t) -> PrayerItem(n, t, n == "Maghrib") } } }
-        else Column(horizontalAlignment = Alignment.CenterHorizontally) { locContent(); Spacer(Modifier.height(16.dp)); if (pt != null) LazyColumn { items(items) { (n, t) -> PrayerItem(n, t, n == "Maghrib") }; item { Spacer(Modifier.height(16.dp)); Text("Sumber: Kemenag RI", style = MaterialTheme.typography.labelSmall, color = Color.Gray, modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center) } } else Text("Silakan update lokasi", color = Color.Gray) }
+        else if (isLand) Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(16.dp)) { Column(Modifier.weight(0.4f), verticalArrangement = Arrangement.Center) { locContent() }; LazyVerticalGrid(GridCells.Fixed(2), Modifier.weight(0.6f), horizontalArrangement = Arrangement.spacedBy(8.dp)) { items(items) { (n, t) -> PrayerItem(n, t, n == nextPrayerName) } } }
+        else Column(horizontalAlignment = Alignment.CenterHorizontally) { locContent(); Spacer(Modifier.height(16.dp)); if (pt != null) LazyColumn { items(items) { (n, t) -> PrayerItem(n, t, n == nextPrayerName) }; item { Spacer(Modifier.height(16.dp)); Text("Sumber: Kemenag RI", style = MaterialTheme.typography.labelSmall, color = Color.Gray, modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center) } } else Text("Silakan update lokasi", color = Color.Gray) }
     }
 }
 
 @Composable
 fun AsmaulHusnaScreen(vm: MainViewModel) {
-    val list by vm.filteredAsmaulHusna.collectAsState(); val q by vm.asmaulQuery.collectAsState(); val str by vm.uiStrings.collectAsState(); val ctx = LocalContext.current
-    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
-        CommonSearchBar(q, { vm.onSearchAsmaul(it) }, str.searchAsmaul)
-        if (list.isEmpty()) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Memuat Asmaul Husna...", color = Color.Gray) }
-        else LazyVerticalGrid(GridCells.Adaptive(150.dp), contentPadding = PaddingValues(16.dp), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            items(list) { item ->
-                // Anti-Crash & Clickable (Fix Force Close)
-                Card(
-                    modifier = Modifier.clickable {
-                        val clip = ClipData.newPlainText("Asmaul Husna", "${item.arab}\n${item.latin}\n${item.artinya}")
-                        (ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(clip)
-                        Toast.makeText(ctx, str.copied, Toast.LENGTH_SHORT).show()
-                    },
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), shape = RoundedCornerShape(16.dp), elevation = CardDefaults.cardElevation(2.dp), border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.1f))
-                ) {
-                    Column(Modifier.padding(16.dp).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text(item.arab ?: "", style = MaterialTheme.typography.headlineMedium.copy(fontFamily = FontFamily.Serif), color = MaterialTheme.colorScheme.primary)
-                        Spacer(Modifier.height(8.dp))
-                        Text(item.latin ?: "", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
-                        Text(item.artinya ?: "", style = MaterialTheme.typography.bodySmall, textAlign = TextAlign.Center, color = Color.Gray)
+    val list by vm.filteredAsmaulHusna.collectAsState(); val q by vm.asmaulQuery.collectAsState(); val str by vm.uiStrings.collectAsState(); val ctx = LocalContext.current; val lang by vm.language.collectAsState()
+    CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
+        Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+            CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) { CommonSearchBar(q, { vm.onSearchAsmaul(it) }, str.searchAsmaul) }
+            if (list.isEmpty()) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Memuat Asmaul Husna...", color = Color.Gray) }
+            else LazyVerticalGrid(GridCells.Adaptive(150.dp), contentPadding = PaddingValues(16.dp), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                items(list) { item ->
+                    val meaning = if(lang == AppLanguage.INDONESIA) item.indo else item.en
+                    Card(modifier = Modifier.clickable { val clip = ClipData.newPlainText("Asmaul Husna", "${item.arab}\n${item.latin}\n$meaning"); (ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(clip); Toast.makeText(ctx, str.copied, Toast.LENGTH_SHORT).show() }, colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), shape = RoundedCornerShape(16.dp), elevation = CardDefaults.cardElevation(2.dp), border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.1f))) {
+                        Box(modifier = Modifier.fillMaxWidth()) {
+                            Surface(modifier = Modifier.align(Alignment.TopStart).padding(8.dp), shape = CircleShape, color = MaterialTheme.colorScheme.primary.copy(alpha = 0.1f)) { Text(text = item.id.toString(), modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp), style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary) }
+                            Column(modifier = Modifier.padding(16.dp).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text(item.arab, style = MaterialTheme.typography.headlineMedium.copy(fontFamily = FontFamily.Serif), color = MaterialTheme.colorScheme.primary)
+                                Spacer(Modifier.height(8.dp)); Text(item.latin, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center); Text(meaning, style = MaterialTheme.typography.bodySmall, textAlign = TextAlign.Center, color = Color.Gray)
+                            }
+                        }
                     }
                 }
             }
@@ -424,22 +539,18 @@ fun DoaScreen(vm: MainViewModel) {
                 var expanded by remember { mutableStateOf(false) }
                 val title = if(lang == AppLanguage.INDONESIA) doa.judul else doa.judulEn
                 val trans = if(lang == AppLanguage.INDONESIA) doa.terjemahan else doa.terjemahanEn
-
                 Card(Modifier.fillMaxWidth().clickable { expanded = !expanded }, colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), shape = RoundedCornerShape(16.dp), elevation = CardDefaults.cardElevation(1.dp)) {
                     Column(Modifier.padding(16.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Box(Modifier.size(32.dp).background(MaterialTheme.colorScheme.secondaryContainer, RoundedCornerShape(8.dp)), contentAlignment = Alignment.Center) { Text(doa.id.toString(), color = MaterialTheme.colorScheme.onSecondaryContainer, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelSmall) }
-                            Spacer(Modifier.width(12.dp)); Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                            Icon(if(expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown, null, tint = Color.Gray)
+                            Spacer(Modifier.width(12.dp)); Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f)); Icon(if(expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown, null, tint = Color.Gray)
                         }
                         if (expanded) {
                             Spacer(Modifier.height(16.dp)); Divider(color = MaterialTheme.colorScheme.outline.copy(alpha=0.2f)); Spacer(Modifier.height(16.dp))
                             Text(doa.arab, style = MaterialTheme.typography.headlineSmall.copy(fontFamily = FontFamily.Serif), color = MaterialTheme.colorScheme.primary, textAlign = TextAlign.End, modifier = Modifier.fillMaxWidth()); Spacer(Modifier.height(12.dp))
                             Text(doa.latin, style = MaterialTheme.typography.bodyMedium.copy(fontStyle = androidx.compose.ui.text.font.FontStyle.Italic), color = MaterialTheme.colorScheme.primary); Spacer(Modifier.height(8.dp))
                             Text(trans, style = MaterialTheme.typography.bodySmall); Spacer(Modifier.height(12.dp))
-                            Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
-                                IconButton({ val clip = ClipData.newPlainText("Doa", "$title\n${doa.arab}\n\n${doa.latin}\n\n$trans"); (ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(clip); Toast.makeText(ctx, str.copied, Toast.LENGTH_SHORT).show() }) { Icon(Icons.Default.ContentCopy, null, tint = Color.Gray, modifier = Modifier.size(20.dp)) }
-                            }
+                            Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) { IconButton({ val clip = ClipData.newPlainText("Doa", "$title\n${doa.arab}\n\n${doa.latin}\n\n$trans"); (ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(clip); Toast.makeText(ctx, str.copied, Toast.LENGTH_SHORT).show() }) { Icon(Icons.Default.ContentCopy, null, tint = Color.Gray, modifier = Modifier.size(20.dp)) } }
                         }
                     }
                 }
@@ -458,32 +569,102 @@ fun getCurrentLocation(ctx: Context, client: FusedLocationProviderClient, vm: Ma
 
 @Composable
 fun QiblaCompassDialog(dismiss: () -> Unit, lat: Double, long: Double) {
-    val ctx = LocalContext.current; val sm = remember { ctx.getSystemService(Context.SENSOR_SERVICE) as SensorManager }
-    val qibla = remember(lat, long) { Location("User").apply { latitude = lat; longitude = long }.bearingTo(Location("Kaaba").apply { latitude = 21.422487; longitude = 39.826206 }) }
+    val ctx = LocalContext.current
+    val sm = remember { ctx.getSystemService(Context.SENSOR_SERVICE) as SensorManager }
+
+    // Ambil WindowManager untuk cek rotasi layar
+    val windowManager = remember { ctx.getSystemService(Context.WINDOW_SERVICE) as WindowManager }
+
+    val qibla = remember(lat, long) {
+        Location("User").apply { latitude = lat; longitude = long }
+            .bearingTo(Location("Kaaba").apply { latitude = 21.422487; longitude = 39.826206 })
+    }
+
     var az by remember { mutableStateOf(0f) }
+
     DisposableEffect(Unit) {
-        val acc = FloatArray(3); val mag = FloatArray(3); val rot = FloatArray(9); val ori = FloatArray(3)
+        val acc = FloatArray(3); val mag = FloatArray(3)
+        val rot = FloatArray(9); val outRot = FloatArray(9) // Matrix baru untuk hasil remap
+        val ori = FloatArray(3)
+
         val l = object : SensorEventListener {
             override fun onSensorChanged(e: SensorEvent?) {
-                if (e == null) return; if (e.sensor.type == Sensor.TYPE_ACCELEROMETER) System.arraycopy(e.values, 0, acc, 0, acc.size) else if (e.sensor.type == Sensor.TYPE_MAGNETIC_FIELD) System.arraycopy(e.values, 0, mag, 0, mag.size)
-                if (SensorManager.getRotationMatrix(rot, null, acc, mag)) { SensorManager.getOrientation(rot, ori); var d = Math.toDegrees(ori[0].toDouble()).toFloat(); if (d < 0) d += 360f; az = d }
+                if (e == null) return
+                if (e.sensor.type == Sensor.TYPE_ACCELEROMETER) System.arraycopy(e.values, 0, acc, 0, acc.size)
+                else if (e.sensor.type == Sensor.TYPE_MAGNETIC_FIELD) System.arraycopy(e.values, 0, mag, 0, mag.size)
+
+                if (SensorManager.getRotationMatrix(rot, null, acc, mag)) {
+                    // --- LOGIC REMAP COORDINATE (FIX LANDSCAPE) ---
+                    val rotation = windowManager.defaultDisplay.rotation
+                    var axisX = SensorManager.AXIS_X
+                    var axisY = SensorManager.AXIS_Y
+
+                    when (rotation) {
+                        Surface.ROTATION_90 -> { // Landscape Kiri
+                            axisX = SensorManager.AXIS_Y
+                            axisY = SensorManager.AXIS_MINUS_X
+                        }
+                        Surface.ROTATION_180 -> { // Terbalik
+                            axisX = SensorManager.AXIS_MINUS_X
+                            axisY = SensorManager.AXIS_MINUS_Y
+                        }
+                        Surface.ROTATION_270 -> { // Landscape Kanan
+                            axisX = SensorManager.AXIS_MINUS_Y
+                            axisY = SensorManager.AXIS_X
+                        }
+                    }
+
+                    // Remap sumbu agar sesuai orientasi layar
+                    SensorManager.remapCoordinateSystem(rot, axisX, axisY, outRot)
+                    SensorManager.getOrientation(outRot, ori)
+
+                    var d = Math.toDegrees(ori[0].toDouble()).toFloat()
+                    if (d < 0) d += 360f
+                    az = d
+                }
             }
             override fun onAccuracyChanged(s: Sensor?, a: Int) {}
         }
-        sm.registerListener(l, sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER), SensorManager.SENSOR_DELAY_UI); sm.registerListener(l, sm.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD), SensorManager.SENSOR_DELAY_UI); onDispose { sm.unregisterListener(l) }
+
+        sm.registerListener(l, sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER), SensorManager.SENSOR_DELAY_UI)
+        sm.registerListener(l, sm.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD), SensorManager.SENSOR_DELAY_UI)
+        onDispose { sm.unregisterListener(l) }
     }
+
     val animAz by animateFloatAsState(-az, tween(200), label="rot")
+
     Dialog(onDismissRequest = dismiss) {
         Card(shape = RoundedCornerShape(24.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), modifier = Modifier.padding(16.dp)) {
             Column(Modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                Text("Arah Kiblat", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary); Spacer(Modifier.height(24.dp))
+                Text("Arah Kiblat", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                Spacer(Modifier.height(24.dp))
                 Box(contentAlignment = Alignment.Center) {
+                    // Piringan Kompas
                     Canvas(Modifier.size(250.dp).rotate(animAz)) {
-                        drawCircle(Color.Gray.copy(alpha=0.3f), size.minDimension/2, style = Stroke(4.dp.toPx())); drawContext.canvas.nativeCanvas.apply { drawText("N", center.x, center.y - size.minDimension/2 + 40.dp.toPx(), android.graphics.Paint().apply { color = android.graphics.Color.RED; textSize = 40.sp.toPx(); textAlign = android.graphics.Paint.Align.CENTER; isFakeBoldText = true }) }
+                        drawCircle(Color.Gray.copy(alpha=0.3f), size.minDimension/2, style = Stroke(4.dp.toPx()))
+                        drawContext.canvas.nativeCanvas.apply {
+                            drawText("N", center.x, center.y - size.minDimension/2 + 40.dp.toPx(), android.graphics.Paint().apply { color = android.graphics.Color.RED; textSize = 40.sp.toPx(); textAlign = android.graphics.Paint.Align.CENTER; isFakeBoldText = true })
+                        }
+                        // Garis Mata Angin
+                        drawLine(Color.Gray, start = Offset(center.x, center.y - size.minDimension/2), end = Offset(center.x, center.y - size.minDimension/2 + 20), strokeWidth = 5f)
+                        drawLine(Color.Gray, start = Offset(center.x, center.y + size.minDimension/2), end = Offset(center.x, center.y + size.minDimension/2 - 20), strokeWidth = 5f)
+                        drawLine(Color.Gray, start = Offset(center.x - size.minDimension/2, center.y), end = Offset(center.x - size.minDimension/2 + 20, center.y), strokeWidth = 5f)
+                        drawLine(Color.Gray, start = Offset(center.x + size.minDimension/2, center.y), end = Offset(center.x + size.minDimension/2 - 20, center.y), strokeWidth = 5f)
                     }
-                    Canvas(Modifier.size(200.dp).rotate(animAz + qibla)) { val p = androidx.compose.ui.graphics.Path().apply { moveTo(center.x, center.y - size.minDimension/2 + 20); lineTo(center.x - 20, center.y); lineTo(center.x + 20, center.y); close() }; drawPath(p, Color(0xFF10B981)); drawCircle(Color(0xFF10B981), 10f, center) }
+                    // Jarum Kiblat
+                    Canvas(Modifier.size(200.dp).rotate(animAz + qibla)) {
+                        val p = androidx.compose.ui.graphics.Path().apply {
+                            moveTo(center.x, center.y - size.minDimension/2 + 20)
+                            lineTo(center.x - 20, center.y)
+                            lineTo(center.x + 20, center.y)
+                            close()
+                        }
+                        drawPath(p, Color(0xFF10B981))
+                        drawCircle(Color(0xFF10B981), 10f, center)
+                    }
                 }
-                Spacer(Modifier.height(24.dp)); Button(onClick = dismiss) { Text("Tutup") }
+                Spacer(Modifier.height(24.dp))
+                Button(onClick = dismiss) { Text("Tutup") }
             }
         }
     }
@@ -499,20 +680,80 @@ fun PrayerItem(n: String, t: String, h: Boolean) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DetailScreen(nav: androidx.navigation.NavController, vm: MainViewModel, n: Int) {
-    val d by vm.detailSurah.collectAsState(); val l by vm.isLoading.collectAsState(); val str by vm.uiStrings.collectAsState(); val lang by vm.language.collectAsState(); val ctx = LocalContext.current
-    LaunchedEffect(n) { vm.fetchSurahDetail(n) }
-    Scaffold(topBar = { TopAppBar(title = { Column { Text(d?.name?.transliteration?.id ?: str.loading, fontWeight = FontWeight.Bold); if (d!=null) Text("${if(lang==AppLanguage.INDONESIA) d!!.name.translation.id else d!!.name.translation.en} • ${d!!.revelation.id}", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onPrimary.copy(alpha=0.8f)) } }, navigationIcon = { IconButton({ nav.popBackStack() }) { Icon(Icons.Default.ArrowBack, "Back") } }, colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.primary, titleContentColor = MaterialTheme.colorScheme.onPrimary, navigationIconContentColor = MaterialTheme.colorScheme.onPrimary)) }) { p ->
-        Box(Modifier.padding(p).fillMaxSize().background(MaterialTheme.colorScheme.background)) { if (l) CircularProgressIndicator(modifier = Modifier.align(Alignment.Center)) else d?.let { details -> LazyColumn(contentPadding = PaddingValues(16.dp)) { items(details.verses) { a -> AyatItem(a, str, lang, ctx) } } } }
+    val surahList by vm.loadedSurahs.collectAsState(); val l by vm.isLoading.collectAsState(); val str by vm.uiStrings.collectAsState(); val lang by vm.language.collectAsState(); val ctx = LocalContext.current
+    LaunchedEffect(n) { if(surahList.isEmpty() || surahList.first().number != n) vm.openSurah(n) }
+
+    Scaffold(topBar = {
+        Column {
+            TopAppBar(
+                title = {
+                    val current = surahList.firstOrNull()
+                    Column {
+                        Text(current?.name?.transliteration?.id ?: str.loading, fontWeight = FontWeight.Bold)
+                        if (current != null) Text(
+                            if(lang==AppLanguage.INDONESIA) current.name.translation.id else current.name.translation.en,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onPrimary.copy(alpha=0.8f)
+                        )
+                    }
+                },
+                navigationIcon = { IconButton({ nav.popBackStack() }) { Icon(Icons.Default.ArrowBack, "Back") } },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.primary,
+                    titleContentColor = MaterialTheme.colorScheme.onPrimary,
+                    navigationIconContentColor = MaterialTheme.colorScheme.onPrimary
+                )
+            )
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(2.dp)
+                    .background(Color.White.copy(alpha = 0.3f))
+            )
+        }
+    }) { p ->
+        Box(Modifier.padding(p).fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+            if (surahList.isEmpty() && l) { CircularProgressIndicator(modifier = Modifier.align(Alignment.Center)) }
+            else {
+                LazyColumn(contentPadding = PaddingValues(16.dp)) {
+                    surahList.forEach { surah ->
+                        item {
+                            Spacer(Modifier.height(16.dp))
+                            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer), modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)) {
+                                Column(Modifier.padding(16.dp).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Text("Surah Ke-${surah.number}", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSecondaryContainer)
+                                    Text(surah.name.transliteration.id, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSecondaryContainer)
+                                    Text("${surah.revelation.id} • ${surah.verses.size} Ayat", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha=0.7f))
+                                    Spacer(Modifier.height(8.dp))
+                                    if (surah.number != 1 && surah.number != 9) Text("بِسْمِ اللَّهِ الرَّحْمَنِ الرَّحِيم", style = MaterialTheme.typography.headlineMedium.copy(fontFamily = FontFamily.Serif), color = MaterialTheme.colorScheme.onSecondaryContainer)
+                                }
+                            }
+                        }
+                        items(surah.verses) { a -> AyatItem(a, str, lang, ctx) }
+                    }
+                    item {
+                        LaunchedEffect(Unit) { vm.loadNextSurah() }
+                        if (l) Box(Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+                        else if (surahList.lastOrNull()?.number == 114) Text("Khatam - Akhir Al-Quran", modifier = Modifier.fillMaxWidth().padding(16.dp), textAlign = TextAlign.Center, color = Color.Gray)
+                    }
+                }
+            }
+        }
     }
 }
 
 @Composable
 fun AyatItem(a: Verse, str: UiStrings, lang: AppLanguage, ctx: Context) {
     val t = if (lang == AppLanguage.INDONESIA) a.translation.id else a.translation.en
+    val juz = a.meta?.juz ?: 0
     Card(Modifier.fillMaxWidth().padding(vertical = 8.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface, contentColor = MaterialTheme.colorScheme.onSurface), shape = RoundedCornerShape(16.dp)) {
         Column(Modifier.padding(16.dp)) {
             Row(horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                Box(Modifier.background(MaterialTheme.colorScheme.primaryContainer, RoundedCornerShape(8.dp)).padding(8.dp, 4.dp)) { Text("${str.verse} ${a.number.inSurah}", color = MaterialTheme.colorScheme.onPrimaryContainer, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold) }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(Modifier.background(MaterialTheme.colorScheme.primaryContainer, RoundedCornerShape(8.dp)).padding(8.dp, 4.dp)) { Text("${str.verse} ${a.number.inSurah}", color = MaterialTheme.colorScheme.onPrimaryContainer, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold) }
+                    Spacer(Modifier.width(8.dp))
+                    if(juz > 0) Surface(color = MaterialTheme.colorScheme.secondary.copy(alpha=0.2f), shape = RoundedCornerShape(4.dp)) { Text("Juz $juz", modifier = Modifier.padding(6.dp, 2.dp), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.secondary) }
+                }
                 IconButton({ val clip = ClipData.newPlainText("Quran", "QS ${a.number.inSurah}\n${a.text.arab}\n\n$t"); (ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(clip); Toast.makeText(ctx, str.copied, Toast.LENGTH_SHORT).show() }) { Icon(Icons.Default.ContentCopy, "Copy", tint = MaterialTheme.colorScheme.outline, modifier = Modifier.size(20.dp)) }
             }
             Spacer(Modifier.height(24.dp)); Text(a.text.arab, modifier = Modifier.fillMaxWidth(), style = MaterialTheme.typography.headlineMedium.copy(textAlign = TextAlign.End, lineHeight = 55.sp, fontFamily = FontFamily.Serif, fontSize = 32.sp), color = MaterialTheme.colorScheme.onSurface)
